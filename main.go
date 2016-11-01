@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,8 @@ import (
 
 var Key string
 var Reader *bufio.Reader
+var programDetails ProgramsWithStats
+var programs Programs
 
 func main() {
 	Reader = bufio.NewReader(os.Stdin)
@@ -28,7 +32,7 @@ func main() {
 }
 
 func prompt() {
-	fmt.Println(`type "new" for a new one, "ls" to list or "quit":`)
+	fmt.Println(`type "new" for a new program, "list", "popularity", "logs" or "quit":`)
 	var command string
 	fmt.Scanln(&command)
 	switch command {
@@ -36,9 +40,106 @@ func prompt() {
 		os.Exit(0)
 	case "ls":
 		listPrograms()
+	case "list":
+		listPrograms()
 	case "new":
 		createNewProgram()
+	case "logs":
+		viewLogs()
+	case "popularity":
+		viewPopularity()
 	}
+}
+
+func viewLogs() {
+	if len(programs) == 0 || programs == nil {
+		getAndSortProgramDetails()
+	}
+
+	var from string
+	var to string
+	fmt.Println("This is an expensive operation, so it's going to take some time. FYI. Type quit to return back.")
+	fmt.Println("Enter a from date (inclusive) like this 2016-10-29 or 2016-09-05 (yyyy-mm-dd):")
+	fmt.Scanln(&from)
+	if from == "quit" {
+		return
+	}
+	fmt.Println("Enter a to date (inclusive) like this 2016-10-29 or 2016-09-05 (yyyy-mm-dd):")
+	fmt.Scanln(&to)
+	if to == "quit" {
+		return
+	}
+
+	fromArray := strings.Split(from, "-")
+	toArray := strings.Split(to, "-")
+
+	fromYear, err := strconv.Atoi(fromArray[0])
+	fromMonth, err := strconv.Atoi(fromArray[1])
+	fromDay, err := strconv.Atoi(fromArray[2])
+
+	toYear, err := strconv.Atoi(toArray[0])
+	toMonth, err := strconv.Atoi(toArray[1])
+	toDay, err := strconv.Atoi(toArray[2])
+
+	if err != nil {
+		fmt.Println("Invalid dates")
+		return
+	}
+
+	fromDate := time.Date(fromYear, time.Month(fromMonth), fromDay, 0, 0, 0, 0, time.UTC)
+	toDate := time.Date(toYear, time.Month(toMonth), toDay, 0, 0, 0, 0, time.UTC)
+
+	var episodesToAccess []Episode
+	for _, program := range programDetails {
+		for _, episode := range program.Episodes {
+			if episode.Pubdate.After(fromDate) && episode.Pubdate.Before(toDate) {
+				episodesToAccess = append(episodesToAccess, episode)
+			}
+		}
+	}
+
+	csvWriter := csv.NewWriter(os.Stdout)
+
+	for _, episode := range episodesToAccess {
+		getJson("http://api.teal.cool/episodes/"+episode.ID, &episode)
+		for _, track := range episode.Tracks {
+			log := Log{"WJRH", track.LogTime, track.Title, track.Artist}
+			if log.LogTime == nil {
+				log.LogTime = episode.Pubdate
+			}
+			array := []string{log.Station, log.LogTime.String(), log.Title, log.Artist}
+			csvWriter.Write(array)
+			csvWriter.Flush()
+		}
+	}
+
+}
+
+type Log struct {
+	Station string
+	LogTime *time.Time
+	Title   string
+	Artist  string
+}
+
+func viewPopularity() {
+	if len(programs) == 0 || programs == nil {
+		getAndSortProgramDetails()
+	}
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Program", "Total Listens"})
+
+	for _, program := range programDetails {
+		for _, episode := range program.Episodes {
+			program.TotalListens += episode.Hits
+		}
+		table.Append([]string{program.Name, strconv.Itoa(program.TotalListens)})
+	}
+
+	fmt.Println()
+	table.Render()
+
 }
 
 func createNewProgram() {
@@ -83,13 +184,26 @@ func listPrograms() {
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"Latest Ep", "Program", "Author"})
 
-	programs := getProgramSummary()
+	if len(programs) == 0 || programs == nil {
+		getAndSortProgramDetails()
+	}
+
+	timeago.English.Max = 170 * time.Hour
+
+	for _, program := range programDetails {
+		table.Append([]string{getPrettyTimeAgo(program.LastPubdate), program.Name, program.Author})
+	}
+	fmt.Println()
+	table.Render()
+}
+
+func getAndSortProgramDetails() {
+	programs = getProgramSummary()
 	fmt.Print("Loading programs")
-	var programDetails ProgramsWithLastPubdate
-	var programDetailsWithoutEpisodes ProgramsWithLastPubdate
+	var programDetailsWithoutEpisodes ProgramsWithStats
 
 	for _, program := range programs {
-		var programDetail ProgramWithLastPubdate
+		var programDetail ProgramWithStats
 		getJson("http://api.teal.cool/programs/"+program.Shortname, &programDetail)
 		fmt.Print(".")
 		getLatestEpsiodeDateRelative(&programDetail)
@@ -102,14 +216,6 @@ func listPrograms() {
 
 	sort.Sort(programDetails)
 	programDetails = append(programDetails, programDetailsWithoutEpisodes...)
-
-	timeago.English.Max = 170 * time.Hour
-
-	for _, program := range programDetails {
-		table.Append([]string{getPrettyTimeAgo(program.LastPubdate), program.Name, program.Author})
-	}
-	fmt.Println()
-	table.Render()
 }
 
 func getPrettyTimeAgo(time *time.Time) string {
@@ -119,7 +225,7 @@ func getPrettyTimeAgo(time *time.Time) string {
 	return timeago.English.Format(*time)
 }
 
-func getLatestEpsiodeDateRelative(program *ProgramWithLastPubdate) {
+func getLatestEpsiodeDateRelative(program *ProgramWithStats) {
 	if len(program.Episodes) == 0 {
 		return
 	}
@@ -164,9 +270,10 @@ type Programs []struct {
 	Tags        []string `json:"tags"`
 }
 
-type ProgramWithLastPubdate struct {
+type ProgramWithStats struct {
 	Program
-	LastPubdate *time.Time
+	LastPubdate  *time.Time
+	TotalListens int
 }
 
 type Program struct {
@@ -207,6 +314,15 @@ type Episode struct {
 	StartTime   *time.Time `json:"start_time"`
 	Type        string     `json:"type"`
 	ID          string     `json:"id"`
+	Tracks      []Track    `json:"tracks"`
+}
+
+type Track struct {
+	Artist  string     `json:"artist"`
+	LogTime *time.Time `json:"log_time"`
+	Mbid    string     `json:"mbid"`
+	Title   string     `json:"title"`
+	ID      string     `json:"id"`
 }
 
 type Episodes []Episode
@@ -215,11 +331,11 @@ func (x Episodes) Len() int           { return len(x) }
 func (x Episodes) Swap(i, j int)      { x[i], x[j] = x[j], x[i] }
 func (x Episodes) Less(i, j int) bool { return x[i].Pubdate.Before(*x[j].Pubdate) }
 
-type ProgramsWithLastPubdate []ProgramWithLastPubdate
+type ProgramsWithStats []ProgramWithStats
 
-func (x ProgramsWithLastPubdate) Len() int      { return len(x) }
-func (x ProgramsWithLastPubdate) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
-func (x ProgramsWithLastPubdate) Less(j, i int) bool {
+func (x ProgramsWithStats) Len() int      { return len(x) }
+func (x ProgramsWithStats) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
+func (x ProgramsWithStats) Less(j, i int) bool {
 	return x[i].LastPubdate.Before(*x[j].LastPubdate)
 }
 
@@ -234,7 +350,7 @@ func getJson(url string, target interface{}) {
 	defer res.Body.Close()
 	err = json.NewDecoder(res.Body).Decode(target)
 	if err != nil {
-		panic("Problem decoding some piece of JSON " + err.Error())
+		panic("Problem decoding some piece of JSON " + url + err.Error())
 	}
 }
 
